@@ -9,6 +9,7 @@
  */
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -27,6 +28,42 @@
 #include "metadata.h"
 #include "nvrm.h"
 
+#define GSP_BUILD_VERSION_LEN 128
+#define GMCAPI_MAX_VGPU_TYPES 128
+
+/* Header stored ahead of the opaque NVA081_CTRL_VGPU_INFO array in the
+ * metadata RMCTRL section. */
+struct metadata_add_vgpu_type_hdr {
+	uint8_t discard_vgpu_types;
+	uint8_t padding[3];
+	uint32_t vgpu_info_count;
+};
+
+/* Prefix expected by gmcapiAddVgpuType().  One opaque vGPU info record is
+ * appended to this header for each GMC round. */
+struct gmcapi_add_vgpu_type_hdr {
+	uint8_t gsp_build_version[GSP_BUILD_VERSION_LEN];
+	struct metadata_add_vgpu_type_hdr params;
+};
+
+struct vgpu_type_blob_view {
+	const struct vgpu_type_blob_hdr *hdr;
+	const uint8_t *info;
+	size_t info_size;
+	uint32_t info_count;
+};
+
+_Static_assert(sizeof(struct metadata_add_vgpu_type_hdr) == 8,
+	       "unexpected metadata add-vGPU-type header layout");
+_Static_assert(sizeof(struct gmcapi_add_vgpu_type_hdr) == 136,
+	       "unexpected GMC add-vGPU-type header layout");
+_Static_assert(offsetof(struct metadata_hdr, data) == 232,
+	       "unexpected metadata header layout");
+_Static_assert(offsetof(struct metadata_blob_hdr, data) == 16,
+	       "unexpected metadata blob header layout");
+_Static_assert(offsetof(struct vgpu_type_blob_hdr, data) == 56,
+	       "unexpected vGPU type blob header layout");
+
 static void usage_add_type(const char *prog)
 {
 	fprintf(stderr,
@@ -38,10 +75,10 @@ static void usage_add_type(const char *prog)
 		prog);
 }
 
-static int validate_metadata(struct metadata_hdr *hdr, size_t file_size)
+static int validate_metadata(const struct metadata_hdr *hdr, size_t file_size)
 {
 	char idr[sizeof(METADATA_IDR)] = {0};
-	uint8_t *p;
+	const uint8_t *p;
 	uint32_t crc;
 
 	memcpy(idr, &hdr->identifier, sizeof(hdr->identifier));
@@ -62,22 +99,39 @@ static int validate_metadata(struct metadata_hdr *hdr, size_t file_size)
 		return -1;
 	}
 
+	if (!memchr(hdr->gsp_build_version, '\0',
+		    sizeof(hdr->gsp_build_version))) {
+		fprintf(stderr, "GSP build version is not NUL-terminated\n");
+		return -1;
+	}
+
 	return 0;
 }
 
-static int send_vgpu_type(int fd, const void *payload, size_t payload_len)
+static int send_vgpu_type(int fd, const uint8_t *info, size_t info_size,
+			  const uint8_t *gsp_build_version, bool discard)
 {
 	struct fwctl_rpc rpc = {0};
 	struct fwctl_rpc_nova_core *req_hdr;
 	struct fwctl_rpc_nova_core resp_hdr;
-	uint32_t hdr_size = sizeof(*req_hdr);
-	uint32_t in_size = hdr_size + payload_len;
+	struct gmcapi_add_vgpu_type_hdr *payload;
+	size_t payload_size;
+	size_t in_size;
+	size_t version_len;
 	void *in_buf;
 	int ret;
 
+	if (info_size > UINT32_MAX - sizeof(*payload) - sizeof(*req_hdr)) {
+		fprintf(stderr, "vGPU info record is too large: %zu bytes\n",
+			info_size);
+		return -EOVERFLOW;
+	}
+	payload_size = sizeof(*payload) + info_size;
+	in_size = sizeof(*req_hdr) + payload_size;
+
 	ret = posix_memalign(&in_buf, 16, in_size);
 	if (ret) {
-		fprintf(stderr, "failed to allocate %u bytes for RPC in buffer\n",
+		fprintf(stderr, "failed to allocate %zu bytes for RPC in buffer\n",
 			in_size);
 		return -ENOMEM;
 	}
@@ -86,13 +140,20 @@ static int send_vgpu_type(int fd, const void *payload, size_t payload_len)
 
 	req_hdr = in_buf;
 	req_hdr->command_id = FWCTL_CMD_NOVA_CORE_GMCAPI_ADD_VGPU_TYPE;
-	memcpy((uint8_t *)in_buf + hdr_size, payload, payload_len);
+	payload = (void *)((uint8_t *)in_buf + sizeof(*req_hdr));
+
+	version_len = strnlen((const char *)gsp_build_version,
+			      GSP_MAX_BUILD_VERSION_LENGTH);
+	memcpy(payload->gsp_build_version, gsp_build_version, version_len);
+	payload->params.discard_vgpu_types = discard;
+	payload->params.vgpu_info_count = 1;
+	memcpy((uint8_t *)payload + sizeof(*payload), info, info_size);
 
 	memset(&resp_hdr, 0, sizeof(resp_hdr));
 
 	rpc.size = sizeof(rpc);
 	rpc.scope = FWCTL_RPC_CONFIGURATION;
-	rpc.in_len = in_size;
+	rpc.in_len = (uint32_t)in_size;
 	rpc.out_len = sizeof(resp_hdr);
 	rpc.in = (uint64_t)(uintptr_t)in_buf;
 	rpc.out = (uint64_t)(uintptr_t)&resp_hdr;
@@ -108,16 +169,13 @@ static int send_vgpu_type(int fd, const void *payload, size_t payload_len)
 	return 0;
 }
 
-/* Bounds + minimum-size check for a single blob header at $bhdr.
- * Called by both passes of send_all_vgpu_types so the second pass
- * doesn't trust the layout validated by the first -- if a future
- * refactor changes which pass does what, both still self-validate. */
+/* Bounds + minimum-size check for a single blob header at @bhdr. */
 static int validate_blob_hdr(const struct metadata_blob_hdr *bhdr,
-			     const void *end, uint64_t idx)
+			     const uint8_t *end, uint64_t idx)
 {
-	const void *p = bhdr;
+	const uint8_t *p = (const uint8_t *)bhdr;
 
-	if (p + sizeof(*bhdr) > end || p + bhdr->size > end) {
+	if (p > end || (size_t)(end - p) < sizeof(*bhdr)) {
 		fprintf(stderr, "blob %lu extends past end of file\n", idx);
 		return -1;
 	}
@@ -126,32 +184,145 @@ static int validate_blob_hdr(const struct metadata_blob_hdr *bhdr,
 			idx, bhdr->size);
 		return -1;
 	}
+	if (bhdr->size > (uint64_t)(end - p)) {
+		fprintf(stderr, "blob %lu extends past end of file\n", idx);
+		return -1;
+	}
 	return 0;
 }
 
-static int send_all_vgpu_types(int fd, void *file_base, size_t file_size, uint64_t device_id)
+static int get_vgpu_type_blob_view(const struct metadata_blob_hdr *bhdr,
+				   uint64_t idx,
+				   struct vgpu_type_blob_view *view)
 {
-	struct metadata_hdr *mhdr = file_base;
-	void *end = (uint8_t *)file_base + file_size;
-	void *cursor;
+	const uint8_t *blob_end = (const uint8_t *)bhdr + bhdr->size;
+	const struct vgpu_type_blob_hdr *vhdr;
+	struct metadata_add_vgpu_type_hdr params;
+	const uint8_t *rmctrl;
+	size_t remaining;
+	uint64_t max_count;
+
+	if ((size_t)(blob_end - bhdr->data) < sizeof(*vhdr)) {
+		fprintf(stderr, "blob %lu is smaller than its vGPU type header\n",
+			idx);
+		return -1;
+	}
+
+	vhdr = (const void *)bhdr->data;
+	remaining = (size_t)(blob_end - vhdr->data);
+	if (vhdr->kernel_struct_size > (uint64_t)remaining) {
+		fprintf(stderr, "blob %lu kernel struct section is out of bounds\n",
+			idx);
+		return -1;
+	}
+
+	rmctrl = vhdr->data + (size_t)vhdr->kernel_struct_size;
+	remaining = (size_t)(blob_end - rmctrl);
+	if (vhdr->gsp_rmctrl_size > (uint64_t)remaining) {
+		fprintf(stderr, "blob %lu GSP RMCTRL section is out of bounds\n",
+			idx);
+		return -1;
+	}
+
+	if (vhdr->gsp_rmctrl_vgpu_info_offset != sizeof(params) ||
+	    vhdr->gsp_rmctrl_size < sizeof(params)) {
+		fprintf(stderr,
+			"blob %lu has unsupported vGPU info offset %lu\n",
+			idx, vhdr->gsp_rmctrl_vgpu_info_offset);
+		return -1;
+	}
+	if (!vhdr->gsp_rmctrl_vgpu_info_size) {
+		fprintf(stderr, "blob %lu has an invalid vGPU info size\n", idx);
+		return -1;
+	}
+
+	memcpy(&params, rmctrl, sizeof(params));
+	if (!params.vgpu_info_count ||
+	    params.vgpu_info_count > GMCAPI_MAX_VGPU_TYPES) {
+		fprintf(stderr, "blob %lu has invalid vGPU info count %u\n",
+			idx, params.vgpu_info_count);
+		return -1;
+	}
+	if (vhdr->num_kernel_structs != params.vgpu_info_count) {
+		fprintf(stderr,
+			"blob %lu kernel/GSP vGPU counts differ (%lu/%u)\n",
+			idx, vhdr->num_kernel_structs,
+			params.vgpu_info_count);
+		return -1;
+	}
+
+	max_count = (vhdr->gsp_rmctrl_size -
+		     vhdr->gsp_rmctrl_vgpu_info_offset) /
+		    vhdr->gsp_rmctrl_vgpu_info_size;
+	if (params.vgpu_info_count > max_count) {
+		fprintf(stderr, "blob %lu vGPU info array is out of bounds\n", idx);
+		return -1;
+	}
+
+	view->hdr = vhdr;
+	view->info = rmctrl + vhdr->gsp_rmctrl_vgpu_info_offset;
+	view->info_size = (size_t)vhdr->gsp_rmctrl_vgpu_info_size;
+	view->info_count = params.vgpu_info_count;
+	return 0;
+}
+
+static int send_vgpu_type_blob(int fd,
+			       const struct vgpu_type_blob_view *view,
+			       const uint8_t *gsp_build_version,
+			       uint64_t *uploaded)
+{
+	uint32_t i;
+
+	fprintf(stderr,
+		"uploading %u vGPU types via multi-round GMC "
+		"(per-round payload: %zu bytes)\n",
+		view->info_count,
+		sizeof(struct gmcapi_add_vgpu_type_hdr) + view->info_size);
+
+	for (i = 0; i < view->info_count; i++) {
+		const uint8_t *info = view->info + i * view->info_size;
+
+		if (send_vgpu_type(fd, info, view->info_size,
+				   gsp_build_version, *uploaded == 0))
+			return -1;
+
+		(*uploaded)++;
+		fprintf(stderr, "  [%u/%u] uploaded\n", i + 1,
+			view->info_count);
+	}
+
+	return 0;
+}
+
+static int send_all_vgpu_types(int fd, const void *file_base,
+			       size_t file_size, uint64_t device_id)
+{
+	const struct metadata_hdr *mhdr = file_base;
+	const uint8_t *end = (const uint8_t *)file_base + file_size;
+	const uint8_t *cursor;
 	uint64_t i;
-	int found = 0, idx = 0;
+	uint64_t found = 0;
+	uint64_t uploaded = 0;
 
 	fprintf(stderr, "device_id:    0x%04lx\n", device_id);
 
-	/* First pass: validate, count matching blob. */
+	/* Validate every blob before changing GSP state. */
 	cursor = mhdr->data;
 	for (i = 0; i < mhdr->num_blobs; i++) {
-		struct metadata_blob_hdr *bhdr = cursor;
+		const struct metadata_blob_hdr *bhdr = (const void *)cursor;
+		struct vgpu_type_blob_view view;
 
 		if (validate_blob_hdr(bhdr, end, i))
 			return -1;
 
-		if (bhdr->type == CONFIG_BLOB_VGPU_TYPE && bhdr->device_id == device_id) {
-			found++;
+		if (bhdr->type == CONFIG_BLOB_VGPU_TYPE) {
+			if (get_vgpu_type_blob_view(bhdr, i, &view))
+				return -1;
+			if (view.hdr->device_id == device_id)
+				found++;
 		}
 
-		cursor = (uint8_t *)cursor + bhdr->size;
+		cursor += (size_t)bhdr->size;
 	}
 
 	if (!found) {
@@ -159,28 +330,29 @@ static int send_all_vgpu_types(int fd, void *file_base, size_t file_size, uint64
 		return -1;
 	}
 
-	fprintf(stderr,
-		"\nuploading %d vGPU types via multi-round GMC\n", found);
-
-	/* Second pass: send each matching blob. */
+	/* Upload each matching blob one vGPU info record per GMC round. */
 	cursor = mhdr->data;
 	for (i = 0; i < mhdr->num_blobs; i++) {
-		struct metadata_blob_hdr *bhdr = cursor;
+		const struct metadata_blob_hdr *bhdr = (const void *)cursor;
+		struct vgpu_type_blob_view view;
 
 		if (validate_blob_hdr(bhdr, end, i))
 			return -1;
 
-		if (bhdr->type == CONFIG_BLOB_VGPU_TYPE && bhdr->device_id == device_id) {
-			idx++;
-			if (send_vgpu_type(fd, bhdr->data, bhdr->size - sizeof(*bhdr)))
+		if (bhdr->type == CONFIG_BLOB_VGPU_TYPE) {
+			if (get_vgpu_type_blob_view(bhdr, i, &view))
+				return -1;
+			if (view.hdr->device_id == device_id &&
+			    send_vgpu_type_blob(fd, &view,
+						mhdr->gsp_build_version,
+						&uploaded))
 				return -1;
 		}
 
-		cursor = (uint8_t *)cursor + bhdr->size;
+		cursor += (size_t)bhdr->size;
 	}
 
-	fprintf(stderr,
-		"\n%d vGPU Types Uploaded. ", idx);
+	fprintf(stderr, "\n%lu vGPU Types Uploaded. ", uploaded);
 	return 0;
 }
 
@@ -280,14 +452,14 @@ int cmd_add_type(const char *prog, int argc, char **argv)
 	/* Validate metadata header */
 	mhdr = meta_mem;
 
-	fprintf(stderr, "metadata :    vgpu %lu.%lu\ngsp_build:    %s\n",
-		mhdr->vgpu_major, mhdr->vgpu_minor,
-		mhdr->gsp_build_version);
-
 	if (validate_metadata(mhdr, st.st_size)) {
 		fprintf(stderr, "metadata validation failed\n");
 		goto out;
 	}
+
+	fprintf(stderr, "metadata :    vgpu %lu.%lu\ngsp_build:    %s\n",
+		mhdr->vgpu_major, mhdr->vgpu_minor,
+		mhdr->gsp_build_version);
 
 	/* Send all vGPU type blobs for the requested device to GSP via fwctl */
 	if (send_all_vgpu_types(fd, meta_mem, st.st_size, device_id)) {

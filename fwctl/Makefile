@@ -28,7 +28,7 @@ SRCS := \
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) $(wildcard *.h)
+$(TARGET): $(SRCS) $(wildcard include/*.h)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
 clean:

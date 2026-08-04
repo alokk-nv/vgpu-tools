@@ -23,7 +23,7 @@ typedef uint8_t NvU8;
 enum fwctl_cmd_nova_core {
 	/*
 	 * Add a single vGPU type.
-	 * Wire: fwctl_rpc_nova_core + vGPU type blob payload IN
+	 * Wire: fwctl_rpc_nova_core + GMC add-vGPU-type payload IN
 	 *       fwctl_rpc_nova_core OUT.
 	 */
 	FWCTL_CMD_NOVA_CORE_GMCAPI_ADD_VGPU_TYPE = 0x00020001,

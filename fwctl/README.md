@@ -124,13 +124,15 @@ entirely).
 
 | Direction | Layout |
 |-----------|--------|
-| **IN**    | request header + opaque vGPU-type blob (binary metadata) |
+| **IN**    | request header + one GMC add-vGPU-type payload |
 | **OUT**   | response header only (no payload) |
 
-The blob is read from a file produced by `vgpu_metadata_tools` (see `../vgpu_metadata_tools/`).
-The subcommand `mmap`s the file, validates the metadata header (identifier
-+ CRC32), then iterates the blobs and uploads every `CONFIG_BLOB_VGPU_TYPE`
-record whose `device_id` matches `-p`.
+The metadata is read from a file produced by `vgpu_metadata_tools`. The
+subcommand validates the identifier and CRC32, finds the nested
+`vgpu_type_blob_hdr` whose `device_id` matches `-p`, then uploads its opaque
+vGPU info records one per GMC round. Each round prepends the metadata's GSP
+build version and sets `vgpuInfoCount` to one; only the first round sets
+`discardVgpuTypes`.
 
 **CLI:**
 ```
@@ -142,11 +144,10 @@ vgpu-mgmt add-type [-d <path>] -f <metadata-file> -p <pci_device_id>
 **Flow:**
 1. Open device.
 2. `mmap` the metadata file; validate the identifier and CRC32 in the header.
-3. For each blob whose `type == CONFIG_BLOB_VGPU_TYPE` and whose
-   `device_id` matches `-p`: build an aligned IN buffer
-   (`sizeof(*req_hdr) + payload_len`), copy the blob payload, and issue
-   `FWCTL_RPC`.
-4. Bail on the first ioctl failure.
+3. For each matching `CONFIG_BLOB_VGPU_TYPE`, validate its nested header and
+   GSP RMCTRL section.
+4. Build and issue one aligned `FWCTL_RPC` request per vGPU info record.
+5. Bail on the first ioctl failure.
 
 ### 2. `FWCTL_CMD_NOVA_CORE_GMCAPI_QUERY_SUPPORTED_VGPU_TYPES` — opcode 2
 **Subcommand:** `vgpu-mgmt list-supported`

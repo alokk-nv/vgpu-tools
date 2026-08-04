@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: MIT
  *
  * On-disk layout for the vGPU metadata blob consumed by `vgpu-mgmt add-type`:
- * fixed header (identifier + CRC32 + version + GSP build) followed by a
- * sequence of typed config blobs.
+ * fixed header (identifier + CRC32 + version + features + GSP build)
+ * followed by a sequence of typed config blobs.
  */
 
 #ifndef __NVIDIA_VGPU_METADATA_H__
@@ -18,6 +18,7 @@ enum {
 };
 
 #define GSP_MAX_BUILD_VERSION_LENGTH (0x0000040)
+#define METADATA_VGPU_FEATURE_SIZE 128
 
 struct metadata_hdr {
 	uint64_t identifier; /* "NVVGPUMT" */
@@ -25,6 +26,7 @@ struct metadata_hdr {
 	uint32_t padding;
 	uint64_t vgpu_major;
 	uint64_t vgpu_minor;
+	uint8_t vgpu_features[METADATA_VGPU_FEATURE_SIZE];
 	uint8_t gsp_build_version[GSP_MAX_BUILD_VERSION_LENGTH];
 	uint64_t num_blobs;
 	unsigned char data[];
@@ -33,8 +35,19 @@ struct metadata_hdr {
 struct metadata_blob_hdr {
 	uint64_t type;
 	uint64_t size;
-	uint64_t device_id;
 	unsigned char data[]; /* blob payload */
+};
+
+struct vgpu_type_blob_hdr {
+	uint64_t device_id;
+	uint64_t gsp_rmctrl_vgpu_info_offset;
+	uint64_t gsp_rmctrl_vgpu_info_size;
+
+	uint64_t kernel_struct_size;
+	uint64_t num_kernel_structs;
+	uint64_t gsp_rmctrl_cmd;
+	uint64_t gsp_rmctrl_size;
+	unsigned char data[]; /* kernel structs, then the GSP RMCTRL payload */
 };
 
 #define POLY 0xEDB88320
