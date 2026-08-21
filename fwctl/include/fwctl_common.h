@@ -104,15 +104,12 @@ int vgpu_type_is_creatable(int fd, NvU32 type_id);
 int vgpu_supported_list_is_empty(int fd);
 
 /*
- * Read the PCI device ID (e.g. 0x27b8) of the device underlying an
- * already-open nova-core fwctl fd. Resolves $fd back to its
- * /dev/fwctl/fwctlN path via /proc/self/fd, then reads
- * /sys/class/fwctl/fwctlN/device/device. Returns 0 with *out_device_id
- * populated on success, -1 with an error logged on any sysfs/procfs
- * failure. Used by add-type to reject a -p value that doesn't match
- * the underlying hardware before any metadata is uploaded.
+ * Read the four PCI IDs of the device underlying an already-open nova-core
+ * fwctl fd from sysfs. Returns 0 with all outputs populated, or -1 with an
+ * error logged. add-type uses them to select the matching metadata group.
  */
-int fwctl_get_pci_device_id(int fd, NvU32 *out_device_id);
+int fwctl_get_pci_ids(int fd, NvU16 *vendor_id, NvU16 *device_id,
+			 NvU16 *subsystem_vendor_id, NvU16 *subsystem_id);
 
 /*
  * After a subcommand's getopt() loop, fail if any positional arguments

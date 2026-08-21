@@ -14,6 +14,7 @@ TARGET := vgpu-mgmt
 SRCS := \
 	vgpu-mgmt.c \
 	fwctl_common.c \
+	metadata.c \
 	nv_add_vgpu_type.c \
 	nv_assign_vgpu_type.c \
 	nv_deassign_vgpu_type.c \

@@ -56,7 +56,7 @@ make
 - FSP vGPU mode turned **on** for the lifecycle commands — flip it
   with `vgpu-mgmt set-vgpu-mode -b <pf> -m on` followed by a cold
   reboot.
-- A vGPU metadata blob (produced by `vgpu_metadata_tools`) for
+- A vGPU metadata file produced by `vgpu-metadata` for
   `add-type` and for `test_vgpu_mgmt.sh -f`.
 
 ## Subcommand summary

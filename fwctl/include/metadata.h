@@ -2,63 +2,70 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
- * On-disk layout for the vGPU metadata blob consumed by `vgpu-mgmt add-type`:
- * fixed header (identifier + CRC32 + version + features + GSP build)
- * followed by a sequence of typed config blobs.
+ * Parser interface for vGPU metadata. File and group header integers are
+ * serialized in little-endian order; vGPU type blobs remain opaque.
  */
 
-#ifndef __NVIDIA_VGPU_METADATA_H__
-#define __NVIDIA_VGPU_METADATA_H__
+#ifndef VGPU_METADATA_H
+#define VGPU_METADATA_H
 
-#define METADATA_IDR "NVVGPUMT"
+#include <stddef.h>
+#include <stdint.h>
 
-enum {
-	CONFIG_BLOB_VGPU_TYPE = 0,
-	CONFIG_BLOB_MAX,
-};
+#define VGPU_METADATA_MAGIC                    "VGPUMETA"
+#define VGPU_METADATA_MAGIC_SIZE               8U
+#define VGPU_METADATA_FORMAT_MAJOR             1U
+#define VGPU_METADATA_FORMAT_MINOR             0U
+#define VGPU_METADATA_GSP_VERSION_SIZE         128U
 
-#define GSP_MAX_BUILD_VERSION_LENGTH (0x0000040)
-#define METADATA_VGPU_FEATURE_SIZE 128
+#define VGPU_METADATA_MAGIC_OFFSET             0U
+#define VGPU_METADATA_MAJOR_OFFSET             8U
+#define VGPU_METADATA_MINOR_OFFSET             10U
+#define VGPU_METADATA_HEADER_SIZE_OFFSET       12U
+#define VGPU_METADATA_TOTAL_SIZE_OFFSET        16U
+#define VGPU_METADATA_GROUP_COUNT_OFFSET       24U
+#define VGPU_METADATA_CRC32_OFFSET             28U
+#define VGPU_METADATA_GSP_VERSION_OFFSET       32U
+#define VGPU_METADATA_HEADER_SIZE              160U
 
-struct metadata_hdr {
-	uint64_t identifier; /* "NVVGPUMT" */
-	uint32_t crc32;
-	uint32_t padding;
-	uint64_t vgpu_major;
-	uint64_t vgpu_minor;
-	uint8_t vgpu_features[METADATA_VGPU_FEATURE_SIZE];
-	uint8_t gsp_build_version[GSP_MAX_BUILD_VERSION_LENGTH];
-	uint64_t num_blobs;
-	unsigned char data[];
-};
+#define VGPU_METADATA_GROUP_TYPE_OFFSET        0U
+#define VGPU_METADATA_GROUP_VERSION_OFFSET     4U
+#define VGPU_METADATA_GROUP_HEADER_SIZE_OFFSET 6U
+#define VGPU_METADATA_GROUP_SIZE_OFFSET        8U
+#define VGPU_METADATA_GROUP_HEADER_SIZE        16U
 
-struct metadata_blob_hdr {
-	uint64_t type;
-	uint64_t size;
-	unsigned char data[]; /* blob payload */
-};
+#define VGPU_METADATA_GROUP_TYPE_INVALID       0U
+#define VGPU_METADATA_GROUP_TYPE_VGPU_TYPE     1U
 
-struct vgpu_type_blob_hdr {
-	uint64_t device_id;
-	uint64_t gsp_rmctrl_vgpu_info_offset;
-	uint64_t gsp_rmctrl_vgpu_info_size;
+#define VGPU_METADATA_VGPU_TYPE_VERSION                1U
+#define VGPU_METADATA_VGPU_VENDOR_ID_OFFSET            16U
+#define VGPU_METADATA_VGPU_DEVICE_ID_OFFSET            18U
+#define VGPU_METADATA_VGPU_SUBSYSTEM_VENDOR_ID_OFFSET  20U
+#define VGPU_METADATA_VGPU_SUBSYSTEM_ID_OFFSET         22U
+#define VGPU_METADATA_VGPU_RECORD_SIZE_OFFSET          24U
+#define VGPU_METADATA_VGPU_RECORD_COUNT_OFFSET         28U
+#define VGPU_METADATA_VGPU_HEADER_SIZE                 32U
 
-	uint64_t kernel_struct_size;
-	uint64_t num_kernel_structs;
-	uint64_t gsp_rmctrl_cmd;
-	uint64_t gsp_rmctrl_size;
-	unsigned char data[]; /* kernel structs, then the GSP RMCTRL payload */
-};
+#define VGPU_METADATA_NVIDIA_PCI_VENDOR_ID     0x10deU
+#define VGPU_METADATA_MAX_GROUPS               1024U
+#define VGPU_METADATA_MAX_FILE_SIZE            (1024U * 1024U * 1024U)
+#define VGPU_METADATA_MAX_VGPU_TYPES           128U
 
-#define POLY 0xEDB88320
+/*
+ * Validate the complete file and return the vgpu_type group matching the
+ * supplied PCI IDs. Validation always reaches EOF before a successful result
+ * is returned, so callers can upload only after this call.
+ */
+int metadata_find_vgpu_type_group(const void *data, size_t size,
+				  uint16_t vendor_id, uint16_t device_id,
+				  uint16_t subsystem_vendor_id,
+				  uint16_t subsystem_id,
+				  const uint8_t **gsp_build_version,
+				  const uint8_t **records,
+				  uint32_t *record_size,
+				  uint32_t *record_count);
 
-static uint32_t crc32_le(uint32_t crc, const uint8_t *buf, size_t len) {
-	for (size_t i = 0; i < len; i++) {
-		crc ^= buf[i];
-		for (int j = 0; j < 8; j++)
-			crc = (crc >> 1) ^ (crc & 1 ? POLY : 0);
-	}
-	return crc;
-}
+/* CRC-32/ISO-HDLC over the whole file with the CRC field treated as zero. */
+uint32_t metadata_compute_crc32(const uint8_t *data, size_t size);
 
-#endif
+#endif /* VGPU_METADATA_H */

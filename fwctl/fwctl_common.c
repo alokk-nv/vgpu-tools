@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -499,19 +500,17 @@ static int fwctl_get_dev_name(int fd, char *out, size_t out_sz)
 	return readlink_basename(proc_path, out, out_sz);
 }
 
-int fwctl_get_pci_device_id(int fd, NvU32 *out_device_id)
+static int fwctl_read_pci_id(const char *name, const char *attribute,
+			     NvU16 *value)
 {
-	char name[64];
 	char sysfs_path[320];
 	char buf[32];
+	char *end;
 	FILE *f;
-	unsigned long device_id;
-
-	if (fwctl_get_dev_name(fd, name, sizeof(name)))
-		return -1;
+	unsigned long parsed;
 
 	snprintf(sysfs_path, sizeof(sysfs_path),
-		 "/sys/class/fwctl/%s/device/device", name);
+		 "/sys/class/fwctl/%s/device/%s", name, attribute);
 	f = fopen(sysfs_path, "r");
 	if (!f) {
 		fprintf(stderr, "open %s: %s\n", sysfs_path, strerror(errno));
@@ -524,8 +523,38 @@ int fwctl_get_pci_device_id(int fd, NvU32 *out_device_id)
 	}
 	fclose(f);
 
-	device_id = strtoul(buf, NULL, 16);
-	*out_device_id = (NvU32)device_id;
+	errno = 0;
+	parsed = strtoul(buf, &end, 0);
+	while (isspace((unsigned char)*end))
+		end++;
+	if (errno == ERANGE || end == buf || *end != '\0' || parsed > UINT16_MAX) {
+		fprintf(stderr, "%s: invalid PCI ID value '%s'\n",
+			sysfs_path, buf);
+		return -1;
+	}
+
+	*value = (NvU16)parsed;
+	return 0;
+}
+
+int fwctl_get_pci_ids(int fd, NvU16 *vendor_id, NvU16 *device_id,
+			 NvU16 *subsystem_vendor_id, NvU16 *subsystem_id)
+{
+	char name[64];
+
+	if (!vendor_id || !device_id || !subsystem_vendor_id || !subsystem_id) {
+		fprintf(stderr, "invalid PCI ID output pointer\n");
+		return -1;
+	}
+	if (fwctl_get_dev_name(fd, name, sizeof(name)))
+		return -1;
+
+	if (fwctl_read_pci_id(name, "vendor", vendor_id) ||
+	    fwctl_read_pci_id(name, "device", device_id) ||
+	    fwctl_read_pci_id(name, "subsystem_vendor", subsystem_vendor_id) ||
+	    fwctl_read_pci_id(name, "subsystem_device", subsystem_id))
+		return -1;
+
 	return 0;
 }
 

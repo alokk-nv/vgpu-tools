@@ -46,7 +46,7 @@ in the metadata blob):
   `/dev/fwctl/fwctlN`.
 - `vgpu-mgmt` copied in this directory (or pointed at via the
   `VGPU_MGMT` env var).
-- A vGPU metadata blob (e.g. `vgpu-xxx.bin`) on disk, passed to
+- A vGPU metadata file on disk, passed to
   `test_vgpu_mgmt.sh` via the required `-f <path>` flag.
 
 ## Tool-level validation (`vgpu-mgmt`)

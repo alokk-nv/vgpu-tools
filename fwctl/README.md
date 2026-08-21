@@ -127,12 +127,13 @@ entirely).
 | **IN**    | request header + one GMC add-vGPU-type payload |
 | **OUT**   | response header only (no payload) |
 
-The metadata is read from a file produced by `vgpu_metadata_tools`. The
-subcommand validates the identifier and CRC32, finds the nested
-`vgpu_type_blob_hdr` whose `device_id` matches `-p`, then uploads its opaque
-vGPU info records one per GMC round. Each round prepends the metadata's GSP
-build version and sets `vgpuInfoCount` to one; only the first round sets
-`discardVgpuTypes`.
+The vGPU metadata is read from a file produced by `vgpu-metadata`.
+The subcommand validates the file header, CRC32, and every group, then finds
+the `vgpu_type` group whose `vendor_id`, `device_id`,
+`subsystem_vendor_id`, and `subsystem_id` match the PF behind the fwctl
+device. It uploads that group's vGPU type blobs one per GMC round. Each round
+prepends the file's `gsp_build_version` and sets `vgpuInfoCount` to one; only
+the first round sets `discardVgpuTypes`.
 
 **CLI:**
 ```
@@ -142,12 +143,70 @@ vgpu-mgmt add-type [-d <path>] -f <metadata-file> -p <pci_device_id>
 `-f` and `-p` are required.
 
 **Flow:**
-1. Open device.
-2. `mmap` the metadata file; validate the identifier and CRC32 in the header.
-3. For each matching `CONFIG_BLOB_VGPU_TYPE`, validate its nested header and
-   GSP RMCTRL section.
-4. Build and issue one aligned `FWCTL_RPC` request per vGPU info record.
+1. Open the device and read its four PCI IDs from sysfs.
+2. `mmap` and validate the complete metadata file.
+3. Find the single matching `vgpu_type` group; unknown nonzero group types
+   are skipped using `group_size`.
+4. Build and issue one aligned `FWCTL_RPC` request per vGPU type blob.
 5. Bail on the first ioctl failure.
+
+#### `VGPUMETA` 1.0 file format
+
+All header integers are encoded explicitly in little-endian order. Legacy
+`NVVGPUMT` files are not supported.
+
+The file header is 160 bytes. Groups begin immediately at offset `0xa0`.
+
+| Offset | Size | Field | Encoding and required value |
+|---:|---:|---|---|
+| `0x00` | 8 | `magic` | ASCII `VGPUMETA`, without a terminator |
+| `0x08` | 2 | `format_major` | `uint16`, value `1` |
+| `0x0a` | 2 | `format_minor` | `uint16`, value `0` |
+| `0x0c` | 4 | `header_size` | `uint32`, value `160` |
+| `0x10` | 8 | `total_size` | `uint64`, exact file size in bytes |
+| `0x18` | 4 | `group_count` | `uint32`, number of following groups |
+| `0x1c` | 4 | `crc32` | `uint32`, CRC-32/ISO-HDLC described below |
+| `0x20` | 128 | `gsp_build_version` | `NV_VERSION_STRING`, NUL-terminated and zero-padded |
+
+Every group starts with this 16-byte common header. A nonzero unknown
+`group_type` is optional in format 1.0 and is skipped using `group_size`.
+
+| Offset | Size | Field | Encoding and meaning |
+|---:|---:|---|---|
+| `0x00` | 4 | `group_type` | `uint32`; `0` is invalid, `1` is `vgpu_type` |
+| `0x04` | 2 | `group_version` | `uint16`, version of this group type |
+| `0x06` | 2 | `header_size` | `uint16`, complete typed-header size |
+| `0x08` | 8 | `group_size` | `uint64`, complete header plus payload size |
+
+A version-1 `vgpu_type` group has a 32-byte header, including the common
+header in its first 16 bytes.
+
+| Offset | Size | Field | Encoding and required value |
+|---:|---:|---|---|
+| `0x00` | 4 | `group_type` | `uint32`, value `1` |
+| `0x04` | 2 | `group_version` | `uint16`, value `1` |
+| `0x06` | 2 | `header_size` | `uint16`, value `32` |
+| `0x08` | 8 | `group_size` | `uint64`, `32 + record_size * record_count` |
+| `0x10` | 2 | `vendor_id` | `uint16`, value `0x10de` |
+| `0x12` | 2 | `device_id` | `uint16`, PCI device ID |
+| `0x14` | 2 | `subsystem_vendor_id` | `uint16`, value `0x10de` |
+| `0x16` | 2 | `subsystem_id` | `uint16`, PCI subsystem device ID |
+| `0x18` | 4 | `record_size` | `uint32`, required size of each vGPU type blob |
+| `0x1c` | 4 | `record_count` | `uint32`, number of compact vGPU type blobs |
+
+The vGPU type blobs start at group offset `0x20` and have no per-blob header
+or padding:
+
+```text
+blob[i]    = group_start + 32 + i * record_size
+group_size = 32 + record_size * record_count
+```
+
+fwctl uploads each vGPU type blob without interpreting its contents.
+
+`crc32` is CRC-32/ISO-HDLC with reflected polynomial `0xedb88320`, initial
+value `0xffffffff`, and final XOR `0xffffffff`. It covers the complete file,
+with bytes `[0x1c, 0x20)` treated as zero.
 
 ### 2. `FWCTL_CMD_NOVA_CORE_GMCAPI_QUERY_SUPPORTED_VGPU_TYPES` — opcode 2
 **Subcommand:** `vgpu-mgmt list-supported`
@@ -336,9 +395,9 @@ so no intermediate `.o` or `.d` files are produced.
 |-----------------------|-------|
 | Transport / wire      | `fwctl.h` (Linux UAPI, ioctls), `nvrm.h` (`fwctl_rpc_nova_core` header, opcodes) |
 | GMCAPI types          | `nv_vgpu.h` (params structs, NVKV keys, `nvidia_get_vgpu_properties`) |
-| Metadata / RM headers | `include/metadata.h` (vGPU metadata binary layout: `METADATA_IDR`, `metadata_hdr`, `metadata_blob_hdr`, `CONFIG_BLOB_VGPU_TYPE`, `crc32_le`); consumed by `add-type` to walk the metadata file produced by that tool |
+| Metadata format       | `include/metadata.h`, `metadata.c` (little-endian fields, CRC and `vgpu_type` group lookup) |
 | NVKV (libraries fork) | `nvkv.h`, `nvkv.c`, `nvkv_stub_defs.h` (userspace stubs for kernel `portMem*`/`REF_*`/`NV_*` machinery) |
 | Dispatcher            | `vgpu-mgmt.c` (top-level `main`, subcommand table) |
-| Shared helpers        | `fwctl_common.{c,h}` — device discovery (`open_nova_core_fwctl`, `open_fwctl_device`), BDF parsing (`parse_dbdf`), PF/VF + vendor gates (`check_*_dbdf`), GSP preflights (`vgpu_query_assigned_type`, `vgpu_type_is_supported`, `vgpu_type_is_creatable`), `QUERY_VGPU_TYPES_MAX`, and the `cmd_*` declarations |
+| Shared helpers        | `fwctl_common.{c,h}` — device discovery (`open_nova_core_fwctl`, `open_fwctl_device`), PCI ID lookup (`fwctl_get_pci_ids`), BDF parsing (`parse_dbdf`), PF/VF + vendor gates (`check_*_dbdf`), GSP preflights (`vgpu_query_assigned_type`, `vgpu_type_is_supported`, `vgpu_type_is_creatable`), `QUERY_VGPU_TYPES_MAX`, and the `cmd_*` declarations |
 | Subcommand sources    | one `nv_*.c` per opcode, each exporting a `cmd_*` entry point |
 | FSP PRC subcommands   | `nv_query_vgpu_mode.c`, `nv_set_vgpu_mode.c`, `prc_knob.{c,h}` — direct BAR0 mailbox path, not an RPC |
