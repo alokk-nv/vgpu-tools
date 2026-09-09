@@ -1,6 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0
  *
  * Userspace mirror of the fwctl UAPI: ioctl numbers, common request/response
  * structures, and the nova-core RPC envelope used by vgpu-mgmt to talk to
